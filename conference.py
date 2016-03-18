@@ -40,7 +40,6 @@ from models import SpeakerForm
 from models import ConferenceQueryForm
 from models import ConferenceQueryForms
 from models import TeeShirtSize
-from models import WishlistForm
 
 from settings import WEB_CLIENT_ID
 from settings import ANDROID_CLIENT_ID
@@ -496,9 +495,8 @@ class ConferenceApi(remote.Service):
         Session(**data).put()
 
         # check if speaker exists in other sections if the do, add to memcache
-        sessions = Session.query(Session.speaker == data['speaker']).count()
-        if sessions > 1:
-            taskqueue.add(params={'speaker': data['speaker']}, url='/tasks/set_featured_speaker')
+
+        taskqueue.add(params={'speaker': data['speaker']}, url='/tasks/set_featured_speaker')
 
         # send request over to form.
         return self._copySessionToForm(request)
@@ -578,7 +576,22 @@ class ConferenceApi(remote.Service):
         return SessionForms(
             items=[self._copySessionToForm(session) for session in filtered_sessions]
         )
-
+    @staticmethod
+    def _cacheFeaturedSpeaker(speaker):
+        sessions = Session.query(Session.speaker == speaker).fetch()
+        # If more than one session is returned:
+        if len(sessions) > 1:
+            # Update string for the new speaker.
+            featSpeak = (SPEAKER_TPL % speaker) + ' ' + 'Sessions:'
+            # Set Memcache with update.
+            for session in sessions:
+                featSpeak += ' ' + session.name
+            memcache.set(MEMCACHE_SPEAKER_KEY, featSpeak)
+        # Otherwise set featSpeak equal to previous value
+        else:
+            featSpeak = (memcache.get(MEMCACHE_SPEAKER_KEY) or "")
+        # Return featured speaker.
+        return featSpeak
 
     @endpoints.method(message_types.VoidMessage, SpeakerForm,
             http_method='GET', name='getFeaturedSpeaker')
@@ -693,60 +706,71 @@ class ConferenceApi(remote.Service):
 
     # - - - Wishlists - - - - - - - - - - - - - - - - -
 
-    @endpoints.method(
-        WishlistForm,
-        ProfileForm,
-        path="profile/addSessionToWishlist",
-        http_method="POST",
-        name="addSessionToWishlist"
-    )
+    @endpoints.method(WISHLIST_POST_REQUEST, SessionForm,
+            http_method='POST', name='addSessionToWishlist')
     def addSessionToWishlist(self, request):
-        """Add a session to the user's wishlist"""
-        # send to _doProfile to save keys in profile
-        profile = self._getProfileFromUser()
-        wssk = request.websafeSessionKey
-        try:
-            sessionKey = ndb.Key(urlsafe=wssk)
-            if sessionKey not in profile.websafeSessionKey:
-                return self._doProfile(request)
-            else:
-                return 'This session is already in your wishlist'
-        except ProtocolBufferDecodeError:
-            wssk = None
-
-    @endpoints.method(WishlistForm, SessionForms,
-                      path="profile/wishlist'",
-                      name="getSessionsInWishlist")
-    def getSessionsInWishlist(self, request):
-        """Get the sessions that a user has saved to their wishlist"""
-        # Get user.
+        """Saves a session to a users wishlist"""
+        # get necessary data items
         user = endpoints.get_current_user()
-        # If the user is not logged in create an error
         if not user:
-            raise endpoints.UnauthorizedException('You must be logged in to view this content')
-        # Get profile
-        profile = self._getProfileFromUser()
-        # Get session keys saved in user wishlist.
-        wishkeys = [ndb.Key(urlsafe=skwl) for skwl in profile.websafeSessionKey]
-        # Query session keys in wishkeys
-        sessions = ndb.get_multi(wishkeys)
+            raise endpoints.UnauthorizedException('Authorization required')
+
+        # get and check session
+        session = ndb.Key(urlsafe=request.websafeSessionKey).get()
+
+        # check to see if that session exists
+        if not session:
+            raise endpoints.NotFoundException(
+                'No session found with key: %s' % request.websafeSessionKey)
+
+        # get profile
+        prof = self._getProfileFromUser()
+
+        # check if that session was already added to wishlist
+        if session.key in prof.sessionsToAttend:
+            raise endpoints.BadRequestException(
+                'This session was already saved to wishlist: %s' % request.websafeSessionKey)
+
+        # add to user profiles wishlist
+        prof.sessionsToAttend.append(session.key)
+        prof.put()
+
+        return self._copySessionToForm(session)
+
+
+    @endpoints.method(message_types.VoidMessage, SessionForms,
+            http_method='POST', name='getSessionsInWishlist')
+    def getSessionsInWishlist(self, request):
+        """Returns a user's wishlist of sessions"""
+        # get necessary data items
+        user = endpoints.get_current_user()
+        if not user:
+            raise endpoints.UnauthorizedException('Authorization required')
+
+        # get profile and wishlist
+        prof = self._getProfileFromUser()
+        session_keys = prof.sessionsToAttend
+        sessions = [session_key.get() for session_key in session_keys]
+
+        # return set
         return SessionForms(
             items=[self._copySessionToForm(session) for session in sessions]
         )
 
     # Delete session in user wishlist
-    @endpoints.method(WishlistForm, ProfileForm,
-            path='profile/deleteSessionFromWishlist',
-            http_method='DELETE',
-            name='deleteSessionFromWishlist')
+    @endpoints.method(WISHLIST_POST_REQUEST, SessionForm,
+            http_method='DELETE', name='deleteSessionFromWishlist')
     def deleteSessionFromWishlist(self, request):
-        """Delete Session from the user wishlist."""
-        profile = self._getProfileFromUser()
-        sessionKey = request.websafeSessionKey
-        if sessionKey in profile.websafeSessionKey:
-            return self._doProfile(request)
+        """Delete Session from user wishlist."""
+        prof = self._getProfileFromUser()
+        wssk = request.websafeSessionKey
+        if wssk in prof.sessionsToAttend:
+            prof.sessionsToAttend.remove(wssk)
+            retval = True
         else:
-            return 'session not in wishlist'
+            retval = False
+        prof.put()
+        return BooleanMessage(data=retval)
 # - - - Announcements - - - - - - - - - - - - - - - - - - - -
 
     @staticmethod
@@ -836,8 +860,8 @@ class ConferenceApi(remote.Service):
                 retval = True
             else:
                 retval = False
+                raise endpoints.UnauthorizedException('You are not authorized to remove this')
 
-        # write things back to the datastore & return
         prof.put()
         conf.put()
         return BooleanMessage(data=retval)

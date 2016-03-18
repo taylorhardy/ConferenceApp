@@ -160,7 +160,3 @@ class ConferenceQueryForms(messages.Message):
     """ConferenceQueryForms -- multiple ConferenceQueryForm inbound form message"""
     filters = messages.MessageField(ConferenceQueryForm, 1, repeated=True)
 
-
-class WishlistForm(messages.Message):
-    """WishlistForm -- Form for adding a session to wishlist"""
-    websafeSessionKey = messages.StringField(2)
